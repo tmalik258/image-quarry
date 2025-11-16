@@ -7,7 +7,6 @@ import aiohttp
 import aiofiles
 from datetime import datetime
 from app.utils.logging import setup_logger
-import structlog
 from segment_anything import sam_model_registry, SamPredictor
 import torch
 

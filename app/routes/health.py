@@ -1,5 +1,6 @@
 from app.utils.logging import setup_logger
 from fastapi import APIRouter, Depends, status
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import text
 from app.database import get_async_db
@@ -21,12 +22,19 @@ async def health_check(db: AsyncSession = Depends(get_async_db)):
         "status": "healthy",
         "service": "image-quarry-api",
         "version": settings.APP_VERSION,
+        "database": "unknown",
+        "redis": "unknown",
+        "models": "unknown",
+        "database_up": False,
+        "redis_up": False,
+        "models_up": False,
     }
     
     # Check database connection
     try:
         await db.execute(text("SELECT 1"))
         status_info["database"] = "healthy"
+        status_info["database_up"] = True
     except Exception as e:
         logger.error(f"Database health check failed: {str(e)}")
         status_info["database"] = "unhealthy"
@@ -38,6 +46,7 @@ async def health_check(db: AsyncSession = Depends(get_async_db)):
         await redis_client.ping()
         await redis_client.close()
         status_info["redis"] = "healthy"
+        status_info["redis_up"] = True
     except Exception as e:
         logger.error(f"Redis health check failed: {str(e)}")
         status_info["redis"] = "unhealthy"
@@ -52,64 +61,29 @@ async def health_check(db: AsyncSession = Depends(get_async_db)):
             "cached": len([m for m in available_models if m.get("cached", False)]),
             "loaded": len([m for m in available_models if m.get("loaded", False)]),
         }
+        status_info["models_up"] = True
     except Exception as e:
         logger.error(f"Model health check failed {str(e)}")
         status_info["models"] = "unhealthy"
         status_info["status"] = "unhealthy"
     
-    # Determine overall status
     if status_info["status"] == "unhealthy":
-        return HealthResponse(
-            status="unhealthy",
+        return JSONResponse(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            content=HealthResponse(
+                status="unhealthy",
+                service=status_info["service"],
+                version=status_info["version"],
+                details=status_info,
+            ).model_dump(),
+        )
+    
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content=HealthResponse(
+            status="healthy",
             service=status_info["service"],
             version=status_info["version"],
             details=status_info,
-        )
-    
-    return HealthResponse(
-        status="healthy",
-        service=status_info["service"],
-        version=status_info["version"],
-        details=status_info,
-    )
-
-
-@router.get("/ready", response_model=HealthResponse)
-async def readiness_check(db: AsyncSession = Depends(get_async_db)):
-    """Readiness check for Kubernetes."""
-    
-    # Check if service is ready to handle requests
-    try:
-        await db.execute(text("SELECT 1"))
-        
-        # Check Redis
-        redis_client = redis.from_url(settings.REDIS_URL)
-        await redis_client.ping()
-        await redis_client.close()
-        
-        return HealthResponse(
-            status="ready",
-            service="image-quarry-api",
-            version=settings.APP_VERSION,
-            details={"ready": True},
-        )
-    except Exception as e:
-        logger.error(f"Readiness check failed {str(e)}")
-        return HealthResponse(
-            status="not_ready",
-            service="image-quarry-api",
-            version=settings.APP_VERSION,
-            details={"ready": False, "error": str(e)},
-        )
-
-
-@router.get("/live", response_model=HealthResponse)
-async def liveness_check():
-    """Liveness check for Kubernetes."""
-    
-    return HealthResponse(
-        status="alive",
-        service="image-quarry-api",
-        version=settings.APP_VERSION,
-        details={"alive": True},
+        ).model_dump(),
     )

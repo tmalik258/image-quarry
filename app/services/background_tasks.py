@@ -1,6 +1,7 @@
 import asyncio
 import base64
 import uuid
+import os
 from typing import Dict, Any, List
 from app.utils.logging import setup_logger
 from celery import Celery
@@ -415,12 +416,16 @@ async def _extract_objects_async(image_b64: str, model_type: str, params: Dict[s
     )
     import numpy as np
     from PIL import Image
-    image_rgb = processor.preprocess_image(image_bytes)
+    image_rgba, image_rgb = processor.preprocess_image_pair(image_bytes)
     extractor = ObjectExtractor(min_pixels=int(params.get("min_pixels", 5000)))
     decoded_masks = []
     for m in masks:
         mask_png_b64 = m["segmentation"]
         mask_array = processor._base64_to_mask(mask_png_b64, image_rgb.shape[:2])
+        try:
+            mask_array = processor.refine_mask(mask_array)
+        except Exception:
+            pass
         decoded_masks.append({"segmentation": mask_array})
     objects = extractor.extract(image_rgb, decoded_masks)
     save_dir = params.get("save_dir") or settings.RESULTS_DIR
@@ -467,6 +472,18 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
             await model_manager.load_model(model_type)
             image_bytes = base64.b64decode(image_b64)
             processor = ImageProcessor()
+            # Quality enhancement step
+            try:
+                from app.services.quality import QualityEnhancer
+                enh = QualityEnhancer(settings)
+                base_dir = params.get("save_dir") or settings.RESULTS_DIR
+                save_dir = os.path.join(base_dir, job_id)
+                os.makedirs(save_dir, exist_ok=True)
+                enhanced = enh.enhance(image_bytes, content_type="image/unknown", job_dir=save_dir)
+                # Save enhanced source and QA artifacts already done by service
+                image_bytes = enhanced["bytes"]
+            except Exception as e:
+                logger.error(f"Quality enhancement failed job_id={job_id} error={str(e)}")
             masks = await processor.segment_image(
                 image_data=image_bytes,
                 model_type=model_type,
@@ -479,7 +496,6 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                     "min_mask_region_area": int(params.get("min_mask_region_area", 1000)),
                 },
             )
-            import os
             base_dir = params.get("save_dir") or settings.RESULTS_DIR
             save_dir = os.path.join(base_dir, job_id)
             try:
@@ -496,7 +512,6 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                 if not data_b64:
                     continue
                 try:
-                    import os
                     mask_bytes = base64.b64decode(data_b64)
                     mask_path = os.path.join(mask_dir, f"mask_{j+1}.png")
                     with open(mask_path, "wb") as f:
@@ -515,7 +530,7 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                 )
             try:
                 from PIL import Image
-                image_rgb = processor.preprocess_image(image_bytes)
+                image_rgba, image_rgb = processor.preprocess_image_pair(image_bytes)
                 extractor = ObjectExtractor(min_pixels=int(params.get("min_pixels", 5000)))
                 decoded_masks = []
                 for m in masks:
@@ -523,6 +538,10 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                     if not b64:
                         continue
                     arr = processor._base64_to_mask(b64, image_rgb.shape[:2])
+                    try:
+                        arr = processor.refine_mask(arr)
+                    except Exception:
+                        pass
                     decoded_masks.append({"segmentation": arr})
                 objects = extractor.extract(image_rgb, decoded_masks)
                 object_dir = os.path.join(save_dir, "objects")
@@ -534,12 +553,12 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                 # Save source image for later comparison
                 try:
                     source_path = os.path.join(save_dir, "source.png")
-                    Image.fromarray(image_rgb).save(source_path)
+                    Image.fromarray(image_rgba).save(source_path)
                 except Exception as e:
                     logger.error(f"Failed to save source image job_id={job_id} error={str(e)}")
                 # Create and save overlay visualization
                 try:
-                    overlay_b64 = processor.create_visualization(image_rgb, masks)
+                    overlay_b64 = processor.create_visualization(image_rgba, masks)
                     overlay_path = os.path.join(save_dir, "overlay.png")
                     with open(overlay_path, "wb") as f:
                         f.write(base64.b64decode(overlay_b64))
@@ -561,3 +580,44 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
             except Exception:
                 pass
             raise
+@celery_app.task(bind=True, name="classify_batch_task")
+def classify_batch_task(self, items: List[Dict[str, Any]], min_confidence: float = 0.25, top_k: int = 3) -> Dict[str, Any]:
+    import asyncio
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        return loop.run_until_complete(_classify_batch_async(items, min_confidence, top_k))
+    finally:
+        loop.close()
+
+
+async def _classify_batch_async(items: List[Dict[str, Any]], min_confidence: float, top_k: int) -> Dict[str, Any]:
+    from app.services.clip_classifier import ClipClassifier
+    clip = ClipClassifier()
+    images = []
+    paths = []
+    for it in items:
+        p = it.get("path")
+        if not p:
+            data_b64 = it.get("image_b64")
+            if not data_b64:
+                continue
+            import base64
+            data = base64.b64decode(data_b64)
+            images.append(clip.load_image(data))
+            paths.append("inline")
+        else:
+            try:
+                with open(p, "rb") as f:
+                    images.append(clip.load_image(f.read()))
+                paths.append(p)
+            except Exception:
+                continue
+    if not images:
+        return {"count": 0, "items": []}
+    feats = clip.encode_images(images)
+    labels = clip.build_concepts()
+    text_feats = clip.encode_texts(labels)
+    res = clip.classify(feats, text_feats, labels, top_k=top_k)
+    items_f = [r for r in res if r["max_confidence"] >= min_confidence]
+    return {"count": len(items_f), "items": items_f}

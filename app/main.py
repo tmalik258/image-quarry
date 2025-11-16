@@ -16,6 +16,7 @@ from app.utils.exceptions import ImageQuarryException
 from app.database import init_db_with_retry
 from app.utils.model_bootstrap import ensure_model_ready
 from app.routes import health, segment, jobs
+from app.routes import classify
 from app.routes import storage
 
 # Configure logging
@@ -64,6 +65,7 @@ app.include_router(health.router)
 app.include_router(segment.router)
 app.include_router(jobs.router)
 app.include_router(storage.router)
+app.include_router(classify.router)
 
 # Add middleware
 app.add_middleware(GZipMiddleware, minimum_size=1000)

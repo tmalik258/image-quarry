@@ -48,19 +48,28 @@ class ImageProcessor:
             return False, f"Invalid image: {str(e)}"
     
     def preprocess_image(self, image_data: bytes) -> np.ndarray:
-        """Preprocess image for SAM."""
-        # Open image
         image = Image.open(io.BytesIO(image_data))
-        
-        # Convert to RGB if necessary
         if image.mode != 'RGB':
             image = image.convert('RGB')
-        
-        # Convert to numpy array
-        image_array = np.array(image)
-        
-        logger.info(f"Preprocessed image: {image_array.shape}")
-        return image_array
+        arr = np.array(image)
+        logger.info(f"Preprocessed image: {arr.shape}")
+        return arr
+
+    def preprocess_image_pair(self, image_data: bytes) -> Tuple[np.ndarray, np.ndarray]:
+        image = Image.open(io.BytesIO(image_data))
+        if image.mode != "RGBA":
+            image = image.convert("RGBA")
+        arr_rgba = np.array(image)
+        arr_rgb = self.rgba_to_rgb_for_model(arr_rgba)
+        logger.info(f"Preprocessed image RGBA: {arr_rgba.shape} RGB: {arr_rgb.shape}")
+        return arr_rgba, arr_rgb
+
+    def rgba_to_rgb_for_model(self, rgba: np.ndarray, bg_color: Tuple[int, int, int] = (128, 128, 128)) -> np.ndarray:
+        a = rgba[:, :, 3].astype(np.float32) / 255.0
+        rgb = rgba[:, :, :3].astype(np.float32)
+        bg = np.array(bg_color, dtype=np.float32).reshape(1, 1, 3)
+        out = rgb * a[..., None] + bg * (1.0 - a[..., None])
+        return out.clip(0, 255).astype(np.uint8)
     
     async def generate_masks(
         self,
@@ -104,9 +113,13 @@ class ImageProcessor:
                         if torch.cuda.is_available():
                             mem_alloc = torch.cuda.memory_allocated() / (1024**2)
                             mem_res = torch.cuda.memory_reserved() / (1024**2)
-                            logger.info(f"Heartbeat op_id={op_id} job_id={job_id} elapsed={time.perf_counter()-start:.2f}s rss_mb={rss_mb:.2f} gpu_alloc_mb={mem_alloc:.2f} gpu_res_mb={mem_res:.2f}")
+                            logger.info(
+                                f"HB op={op_id} job={job_id if job_id else 'none'} dur={time.perf_counter()-start:.2f}s rss={rss_mb:.0f}MB gpu={mem_alloc:.0f}/{mem_res:.0f}MB"
+                            )
                         else:
-                            logger.info(f"Heartbeat op_id={op_id} job_id={job_id} elapsed={time.perf_counter()-start:.2f}s rss_mb={rss_mb:.2f} gpu=unavailable")
+                            logger.info(
+                                f"HB op={op_id} job={job_id if job_id else 'none'} dur={time.perf_counter()-start:.2f}s rss={rss_mb:.0f}MB gpu=NA"
+                            )
                     except Exception:
                         pass
                     await asyncio.sleep(2)
@@ -150,7 +163,7 @@ class ImageProcessor:
     ) -> List[Dict[str, Any]]:
         from time import perf_counter
         t0 = perf_counter()
-        image_rgb = self.preprocess_image(image_data)
+        image_rgba, image_rgb = self.preprocess_image_pair(image_data)
         if predictor is None:
             from app.services.model_manager import model_manager
             predictor = await model_manager.load_model(model_type or settings.DEFAULT_MODEL)
@@ -220,7 +233,8 @@ class ImageProcessor:
         self,
         original_image: np.ndarray,
         masks: List[Dict[str, Any]],
-        max_masks: int = 10
+        max_masks: int = 10,
+        with_labels: bool = True
     ) -> str:
         """Create visualization overlay of masks on original image."""
         try:
@@ -241,8 +255,11 @@ class ImageProcessor:
             colors = self._generate_colors(len(top_masks))
             
             for i, mask_data in enumerate(top_masks):
-                # Decode mask
                 mask = self._base64_to_mask(mask_data['segmentation'], original_image.shape[:2])
+                try:
+                    mask = self.refine_mask(mask)
+                except Exception:
+                    pass
                 
                 # Convert mask to PIL
                 mask_pil = Image.fromarray((mask * 255).astype(np.uint8), mode='L')
@@ -252,17 +269,24 @@ class ImageProcessor:
                 
                 # Apply mask to overlay
                 overlay = Image.composite(color_overlay, overlay, mask_pil)
+                if with_labels:
+                    try:
+                        ys, xs = np.where(mask > 0)
+                        if len(xs) and len(ys):
+                            cx = int(np.mean(xs))
+                            cy = int(np.mean(ys))
+                            label_text = str(i + 1)
+                            tw, th = 16, 16
+                            bg = Image.new('RGBA', (tw, th), (0, 0, 0, 128))
+                            overlay.paste(bg, (max(0, cx - tw // 2), max(0, cy - th // 2)))
+                            draw.text((cx - 4, cy - 8), label_text, fill=(255, 255, 255, 255))
+                    except Exception:
+                        pass
             
-            # Combine original with overlay
             original_rgba = original_pil.convert('RGBA')
             result = Image.alpha_composite(original_rgba, overlay)
-            
-            # Convert back to RGB
-            result_rgb = result.convert('RGB')
-            
-            # Convert to base64
             buffer = io.BytesIO()
-            result_rgb.save(buffer, format='PNG')
+            result.save(buffer, format='PNG')
             buffer.seek(0)
             
             visualization_b64 = base64.b64encode(buffer.getvalue()).decode('utf-8')
@@ -291,22 +315,20 @@ class ImageProcessor:
         return base64.b64encode(buffer.getvalue()).decode('utf-8')
     
     def _base64_to_mask(self, base64_str: str, shape: Tuple[int, int]) -> np.ndarray:
-        """Convert base64 string back to mask array."""
-        # Decode base64
         image_data = base64.b64decode(base64_str)
-        
-        # Load as image
         mask_pil = Image.open(io.BytesIO(image_data))
-        
-        # Convert to numpy
         mask_array = np.array(mask_pil)
-        
-        # Ensure correct shape
         if mask_array.shape != shape:
-            mask_array = cv2.resize(mask_array, (shape[1], shape[0]))
-        
-        # Convert to binary
+            mask_array = cv2.resize(mask_array, (shape[1], shape[0]), interpolation=cv2.INTER_NEAREST)
         return (mask_array > 127).astype(np.uint8)
+
+    def refine_mask(self, mask: np.ndarray) -> np.ndarray:
+        k = np.ones((3, 3), np.uint8)
+        m = (mask > 0).astype(np.uint8) * 255
+        m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
+        m = cv2.medianBlur(m, 3)
+        return (m > 127).astype(np.uint8)
     
     def _generate_colors(self, num_colors: int) -> List[Tuple[int, int, int]]:
         """Generate distinct colors for visualization."""

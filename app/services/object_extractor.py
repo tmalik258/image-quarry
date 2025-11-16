@@ -31,7 +31,10 @@ class ObjectExtractor:
             cropped_image = image_rgb[y_min:y_max, x_min:x_max]
             segmented_object = cv2.bitwise_and(cropped_image, cropped_image, mask=cropped_mask)
             b, g, r = cv2.split(segmented_object)
-            alpha = cropped_mask
+            try:
+                alpha = cv2.GaussianBlur(cropped_mask, (3, 3), 0)
+            except Exception:
+                alpha = cropped_mask
             rgba = cv2.merge([b, g, r, alpha])
             objects.append(rgba)
         return objects
@@ -41,7 +44,11 @@ class ObjectExtractor:
         saved_paths: List[str] = []
         for i, obj in enumerate(objects, start=1):
             out_path = os.path.join(save_dir, f"object_{i}.png")
-            cv2.imwrite(out_path, obj)
+            try:
+                rgba = cv2.cvtColor(obj, cv2.COLOR_BGRA2RGBA)
+                Image.fromarray(rgba).save(out_path)
+            except Exception:
+                cv2.imwrite(out_path, obj)
             saved_paths.append(out_path)
         logger.info(f"Saved segmented objects count={len(saved_paths)} dir={save_dir}")
         return saved_paths

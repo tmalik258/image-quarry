@@ -352,6 +352,10 @@ async def list_job_files(job_id: str):
         masks = sorted(glob.glob(os.path.join(mask_dir, "mask_*.png")))
         objects = sorted(glob.glob(os.path.join(obj_dir, "object_*.png")))
         overlay = os.path.join(job_dir, "overlay.png")
+        labels = os.path.join(job_dir, "labels.jsonl")
+        source_enhanced = os.path.join(job_dir, "source_enhanced.png")
+        quality = os.path.join(job_dir, "quality.json")
+        diff = os.path.join(job_dir, "diff.png")
         return {
             "job_id": job_id,
             "directory": job_dir,
@@ -360,6 +364,10 @@ async def list_job_files(job_id: str):
             "masks": masks,
             "objects": objects,
             "overlay": overlay if os.path.exists(overlay) else None,
+            "labels": labels if os.path.exists(labels) else None,
+            "source_enhanced": source_enhanced if os.path.exists(source_enhanced) else None,
+            "quality": quality if os.path.exists(quality) else None,
+            "diff": diff if os.path.exists(diff) else None,
         }
     except Exception as e:
         logger.error(f"Failed to list job files: {str(e)}")

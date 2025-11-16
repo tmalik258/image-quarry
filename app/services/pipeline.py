@@ -46,7 +46,7 @@ async def process_image_pipeline(
 
     import time
     t_start = time.perf_counter()
-    image_rgb = await asyncio.to_thread(processor.preprocess_image, image_bytes)
+    image_rgba, image_rgb = await asyncio.to_thread(processor.preprocess_image_pair, image_bytes)
     try:
         import psutil
         rss_mb = float(psutil.Process(os.getpid()).memory_info().rss) / (1024**2)
@@ -118,6 +118,10 @@ async def process_image_pipeline(
     for m in masks:
         try:
             arr = processor._base64_to_mask(m["segmentation"], image_rgb.shape[:2])
+            try:
+                arr = processor.refine_mask(arr)
+            except Exception:
+                pass
             decoded.append({"segmentation": arr})
         except Exception:
             continue
@@ -131,11 +135,19 @@ async def process_image_pipeline(
 
     # Visualization overlay
     t_vis0 = time.perf_counter()
-    overlay_b64 = processor.create_visualization(image_rgb, masks)
+    overlay_b64 = processor.create_visualization(image_rgba, masks)
     overlay_path = os.path.join(output_dir, "overlay.png")
     with open(overlay_path, "wb") as f:
         f.write(base64.b64decode(overlay_b64))
     logger.info(f"Visualization took {time.perf_counter() - t_vis0:.2f}s")
+
+    # Quality enhancement and QA artifacts for pipeline mode
+    try:
+        from app.services.quality import QualityEnhancer
+        enh = QualityEnhancer(settings)
+        enhanced = enh.enhance(image_bytes, content_type=content_type, job_dir=output_dir)
+    except Exception as e:
+        logger.error(f"Quality enhancement (pipeline) failed job_id={job_id} error={str(e)}")
 
     # Metadata
     metadata = {
@@ -157,6 +169,9 @@ async def process_image_pipeline(
         "masks": mask_paths,
         "objects": object_paths,
         "metadata": metadata_path,
+        "source_enhanced": os.path.join(output_dir, "source_enhanced.png") if os.path.exists(os.path.join(output_dir, "source_enhanced.png")) else None,
+        "quality": os.path.join(output_dir, "quality.json") if os.path.exists(os.path.join(output_dir, "quality.json")) else None,
+        "diff": os.path.join(output_dir, "diff.png") if os.path.exists(os.path.join(output_dir, "diff.png")) else None,
     }
 
     logger.info(f"Pipeline completed in {time.perf_counter() - t_start:.2f}s")

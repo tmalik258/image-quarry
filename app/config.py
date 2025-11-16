@@ -86,6 +86,12 @@ class Settings(BaseSettings):
         default=["jpeg", "jpg", "png", "webp", "bmp", "tiff"],
         description="Supported image formats"
     )
+    # Quality Enhancement
+    QUALITY_MIN_WIDTH: int = Field(default=800, description="Minimum width for enhanced image")
+    QUALITY_MIN_HEIGHT: int = Field(default=1440, description="Minimum height for enhanced image")
+    QUALITY_SCALE_FACTOR: float = Field(default=1.5, description="Default upscaling factor")
+    QUALITY_TARGET_BYTES: int = Field(default=1_000_000, description="Target minimum file size in bytes")
+    QUALITY_SAVE_FORMAT_PRIORITY: List[str] = Field(default=["PNG", "WEBP", "JPEG"], description="Format order for saving enhanced images")
     
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = Field(
