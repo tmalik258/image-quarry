@@ -1,0 +1,17 @@
+.git
+.gitignore
+.env
+.env.*
+.trae/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+image_quarry.ipynb
+output/
+uploads/
+logs/
+models/.cache/
+tests/__pycache__/
+app/__pycache__/

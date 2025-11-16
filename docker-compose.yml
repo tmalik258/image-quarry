@@ -1,0 +1,126 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: app/Dockerfile
+    image: image-quarry-app:latest
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/image_quarry
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MODEL_CACHE_DIR=/code/models
+      - UPLOAD_DIR=/code/uploads
+    volumes:
+      - ./:/code
+      - model_cache:/code/models
+      - upload_data:/code/uploads
+      - app_logs:/code/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_network
+    restart: unless-stopped
+    runtime: nvidia
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health/live"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  worker:
+    image: image-quarry-app:latest
+    command: ["python", "-m", "celery", "-A", "app.services.background_tasks.celery_app", "worker", "--loglevel=info", "--concurrency=2"]
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/image_quarry
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - MODEL_CACHE_DIR=/code/models
+      - CELERY_TASK_SOFT_TIME_LIMIT=1800
+      - CELERY_TASK_TIME_LIMIT=2100
+    volumes:
+      - ./:/code
+      - model_cache:/code/models
+      - worker_logs:/code/logs
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_network
+    restart: unless-stopped
+    runtime: nvidia
+
+  scheduler:
+    image: image-quarry-app:latest
+    command: ["python", "-m", "celery", "-A", "app.services.background_tasks.celery_app", "beat", "--loglevel=info"]
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://postgres:password@db:5432/image_quarry
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/1
+      - CELERY_RESULT_BACKEND=redis://redis:6379/2
+      - CELERY_TASK_SOFT_TIME_LIMIT=1800
+      - CELERY_TASK_TIME_LIMIT=2100
+    volumes:
+      - ./:/code
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    networks:
+      - app_network
+    restart: unless-stopped
+    runtime: nvidia
+
+  db:
+    image: postgres:15
+    environment:
+      - POSTGRES_DB=image_quarry
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=password
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    networks:
+      - app_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:8-alpine
+    command: redis-server --appendonly yes --maxmemory 512mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    networks:
+      - app_network
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_cache:
+  upload_data:
+  app_logs:
+  worker_logs:
+
+networks:
+  app_network:
+    driver: bridge
