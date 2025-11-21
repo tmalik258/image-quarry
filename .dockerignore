@@ -15,3 +15,4 @@ logs/
 models/.cache/
 tests/__pycache__/
 app/__pycache__/
+.trunk/

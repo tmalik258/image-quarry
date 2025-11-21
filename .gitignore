@@ -224,4 +224,5 @@ results/
 # Sample data
 samples/
 
-
+# Trunk
+.trunk/
