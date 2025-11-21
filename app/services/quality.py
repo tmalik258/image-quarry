@@ -184,3 +184,31 @@ class QualityEnhancer:
             "report_path": os.path.join(job_dir, "quality.json"),
             "diff_path": heat_path,
         }
+
+def histogram_rgb(arr: np.ndarray) -> Dict[str, Any]:
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        r = np.histogram(arr[:, :, 0].ravel(), bins=256, range=(0, 255))[0]
+        g = np.histogram(arr[:, :, 1].ravel(), bins=256, range=(0, 255))[0]
+        b = np.histogram(arr[:, :, 2].ravel(), bins=256, range=(0, 255))[0]
+        return {"r": r.tolist(), "g": g.tolist(), "b": b.tolist()}
+    h = np.histogram(arr.ravel(), bins=256, range=(0, 255))[0]
+    return {"gray": h.tolist()}
+
+def delta_e(a: np.ndarray, b: np.ndarray) -> float:
+    if a.ndim == 3 and a.shape[2] >= 3:
+        a_bgr = cv2.cvtColor(a[:, :, :3], cv2.COLOR_RGB2BGR)
+        b_bgr = cv2.cvtColor(b[:, :, :3], cv2.COLOR_RGB2BGR)
+        a_lab = cv2.cvtColor(a_bgr, cv2.COLOR_BGR2LAB)
+        b_lab = cv2.cvtColor(b_bgr, cv2.COLOR_BGR2LAB)
+        d = a_lab.astype(np.float32) - b_lab.astype(np.float32)
+        return float(np.mean(np.sqrt(np.sum(d * d, axis=2))))
+    return 0.0
+
+def compare_color(source_rgba: np.ndarray, object_rgba: np.ndarray, mask: np.ndarray) -> Dict[str, Any]:
+    m = (mask > 0)
+    src = source_rgba[:, :, :3].copy()
+    obj = object_rgba[:, :, :3].copy()
+    src_m = src[m]
+    obj_m = obj[m]
+    de = delta_e(src_m.reshape(-1, 1, 3), obj_m.reshape(-1, 1, 3)) if src_m.size and obj_m.size else 0.0
+    return {"deltaE": de, "hist_source": histogram_rgb(src), "hist_object": histogram_rgb(obj)}

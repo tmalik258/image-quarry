@@ -427,9 +427,16 @@ async def _extract_objects_async(image_b64: str, model_type: str, params: Dict[s
         except Exception:
             pass
         decoded_masks.append({"segmentation": mask_array})
-    objects = extractor.extract(image_rgb, decoded_masks)
+    objects_with_bbox = extractor.extract(image_rgba, decoded_masks)
     save_dir = params.get("save_dir") or settings.RESULTS_DIR
-    paths = extractor.save_objects(objects, save_dir)
+    import io
+    icc = None
+    try:
+        from PIL import Image
+        icc = Image.open(io.BytesIO(image_bytes)).info.get("icc_profile")
+    except Exception:
+        icc = None
+    paths = extractor.save_objects([o for o, b in objects_with_bbox], save_dir, icc_profile=icc)
     drive_files = []
     if bool(params.get("save_to_drive", False)):
         try:
@@ -543,13 +550,38 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                     except Exception:
                         pass
                     decoded_masks.append({"segmentation": arr})
-                objects = extractor.extract(image_rgb, decoded_masks)
+                objects_with_bbox = extractor.extract(image_rgba, decoded_masks)
                 object_dir = os.path.join(save_dir, "objects")
                 try:
                     os.makedirs(object_dir, exist_ok=True)
                 except Exception:
                     pass
-                _ = extractor.save_objects(objects, object_dir)
+                icc = None
+                try:
+                    import io
+                    icc = Image.open(io.BytesIO(image_bytes)).info.get("icc_profile")
+                except Exception:
+                    icc = None
+                _ = extractor.save_objects([o for o, b in objects_with_bbox], object_dir, icc_profile=icc)
+                try:
+                    from app.services.quality import compare_color
+                    for idx, (obj_rgba, bbox) in enumerate(objects_with_bbox, start=1):
+                        x1, y1, x2, y2 = bbox
+                        src_region = image_rgba[y1:y2, x1:x2]
+                        mask_local = (obj_rgba[:, :, 3] > 0).astype(np.uint8) * 255
+                        metrics = compare_color(src_region, obj_rgba, mask_local)
+                        thr_de = float(getattr(settings, "EXTRACTION_MAX_DELTA_E", 2.0))
+                        thr_hist = float(getattr(settings, "EXTRACTION_MAX_HISTO_DIFF", 0.02))
+                        try:
+                            import json
+                            with open(os.path.join(object_dir, f"object_{idx}_color_report.json"), "w", encoding="utf-8") as f:
+                                json.dump(metrics, f, ensure_ascii=False, indent=2)
+                        except Exception:
+                            pass
+                        if metrics.get("deltaE", 0.0) > thr_de:
+                            logger.warning(f"Color deviation object={idx} job_id={job_id} deltaE={metrics.get('deltaE'):.3f}")
+                except Exception as e:
+                    logger.error(f"Color comparison failed job_id={job_id} error={str(e)}")
                 # Save source image for later comparison
                 try:
                     source_path = os.path.join(save_dir, "source.png")
@@ -564,6 +596,42 @@ async def _segment_pipeline_async(task, image_b64: str, model_type: str, params:
                         f.write(base64.b64decode(overlay_b64))
                 except Exception as e:
                     logger.error(f"Failed to save overlay visualization job_id={job_id} error={str(e)}")
+                # Generate plain shirt (standardized to plain_shirt_2.png)
+                try:
+                    ratio_thr = float(getattr(settings, "PLAIN_SHIRT_LOGO_MAX_RATIO", 0.25))
+                    radius = int(getattr(settings, "PLAIN_SHIRT_INPAINT_RADIUS", 3))
+                    plain_shirts = processor.generate_plain_shirts(image_rgba, masks, ratio_thresh=ratio_thr, inpaint_radius=radius)
+                    if plain_shirts:
+                        chosen = plain_shirts[1] if len(plain_shirts) >= 2 else plain_shirts[0]
+                        out_ps = os.path.join(object_dir, "plain_shirt_2.png")
+                        Image.fromarray(chosen).save(out_ps)
+                except Exception as e:
+                    logger.error(f"Plain shirt generation failed job_id={job_id} error={str(e)}")
+
+                try:
+                    if bool(settings.GOOGLE_DRIVE_ENABLED):
+                        from app.services.storage.google_drive import GoogleDriveService
+                        drive = GoogleDriveService()
+                        folder_id = settings.DRIVE_FOLDER_ID
+                        upload_paths = []
+                        try:
+                            upload_paths.append(os.path.join(save_dir, "source.png"))
+                        except Exception:
+                            pass
+                        upload_paths.append(overlay_path)
+                        try:
+                            for p in os.listdir(object_dir):
+                                upload_paths.append(os.path.join(object_dir, p))
+                        except Exception:
+                            pass
+                        for p in upload_paths:
+                            try:
+                                if p and os.path.exists(p):
+                                    drive.upload_file(p, folder_id=folder_id)
+                            except Exception as e:
+                                logger.error(f"Drive upload failed job_id={job_id} path={p} error={str(e)}")
+                except Exception as e:
+                    logger.error(f"Drive upload init failed job_id={job_id} error={str(e)}")
             except Exception as e:
                 logger.error(f"Object extraction failed job_id={job_id} error={str(e)}")
             job.status = "completed"

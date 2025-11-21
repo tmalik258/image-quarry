@@ -92,6 +92,10 @@ class Settings(BaseSettings):
     QUALITY_SCALE_FACTOR: float = Field(default=1.5, description="Default upscaling factor")
     QUALITY_TARGET_BYTES: int = Field(default=1_000_000, description="Target minimum file size in bytes")
     QUALITY_SAVE_FORMAT_PRIORITY: List[str] = Field(default=["PNG", "WEBP", "JPEG"], description="Format order for saving enhanced images")
+    EXTRACTION_MAX_DELTA_E: float = Field(default=2.0, description="Max allowed color deltaE between source and object")
+    EXTRACTION_MAX_HISTO_DIFF: float = Field(default=0.02, description="Max allowed histogram difference ratio")
+    PLAIN_SHIRT_LOGO_MAX_RATIO: float = Field(default=0.25, description="Max logo area relative to shirt mask to remove")
+    PLAIN_SHIRT_INPAINT_RADIUS: int = Field(default=3, description="Inpaint radius for logo removal")
     
     # Rate Limiting
     RATE_LIMIT_PER_MINUTE: int = Field(

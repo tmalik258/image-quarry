@@ -47,6 +47,13 @@ async def process_image_pipeline(
     import time
     t_start = time.perf_counter()
     image_rgba, image_rgb = await asyncio.to_thread(processor.preprocess_image_pair, image_bytes)
+    from PIL import Image
+    import io
+    icc = None
+    try:
+        icc = Image.open(io.BytesIO(image_bytes)).info.get("icc_profile")
+    except Exception:
+        icc = None
     try:
         import psutil
         rss_mb = float(psutil.Process(os.getpid()).memory_info().rss) / (1024**2)
@@ -77,12 +84,12 @@ async def process_image_pipeline(
     logger.info(f"Model ready in {time.perf_counter() - t_load0:.2f}s job_id={job_id}")
 
     auto_params = {
-        "points_per_side": 64,
-        "pred_iou_thresh": 0.90,
-        "stability_score_thresh": 0.92,
-        "crop_n_layers": 1,
+        "points_per_side": 160,
+        "pred_iou_thresh": 0.92,
+        "stability_score_thresh": 0.95,
+        "crop_n_layers": 3,
         "crop_n_points_downscale_factor": 2,
-        "min_mask_region_area": 1000,
+        "min_mask_region_area":2000,
     }
 
     t_seg0 = time.perf_counter()
@@ -127,10 +134,28 @@ async def process_image_pipeline(
             continue
 
     t_extract0 = time.perf_counter()
-    objects = await asyncio.to_thread(extractor.extract, image_rgb, decoded)
+    objects_with_bbox = await asyncio.to_thread(extractor.extract, image_rgba, decoded)
     object_dir = os.path.join(output_dir, "objects")
     os.makedirs(object_dir, exist_ok=True)
-    object_paths = await asyncio.to_thread(extractor.save_objects, objects, object_dir)
+    object_paths = await asyncio.to_thread(extractor.save_objects, [o for o, b in objects_with_bbox], object_dir, icc)
+    try:
+        from app.services.quality import compare_color
+        for idx, (obj_rgba, bbox) in enumerate(objects_with_bbox, start=1):
+            x1, y1, x2, y2 = bbox
+            src_region = image_rgba[y1:y2, x1:x2]
+            mask_local = (obj_rgba[:, :, 3] > 0).astype(np.uint8) * 255
+            metrics = compare_color(src_region, obj_rgba, mask_local)
+            thr_de = float(getattr(settings, "EXTRACTION_MAX_DELTA_E", 2.0))
+            if metrics.get("deltaE", 0.0) > thr_de:
+                logger.warning(f"Color deviation object={idx} deltaE={metrics.get('deltaE'):.3f}")
+            try:
+                import json
+                with open(os.path.join(object_dir, f"object_{idx}_color_report.json"), "w", encoding="utf-8") as f:
+                    json.dump(metrics, f, ensure_ascii=False, indent=2)
+            except Exception:
+                pass
+    except Exception as e:
+        logger.error(f"Color comparison failed error={str(e)}")
     logger.info(f"Object extraction took {time.perf_counter() - t_extract0:.2f}s, objects={len(object_paths)}")
 
     # Visualization overlay
@@ -140,6 +165,20 @@ async def process_image_pipeline(
     with open(overlay_path, "wb") as f:
         f.write(base64.b64decode(overlay_b64))
     logger.info(f"Visualization took {time.perf_counter() - t_vis0:.2f}s")
+
+    # Plain shirts (logos removed) as additional outputs
+    try:
+        ratio_thr = float(getattr(settings, "PLAIN_SHIRT_LOGO_MAX_RATIO", 0.25))
+        radius = int(getattr(settings, "PLAIN_SHIRT_INPAINT_RADIUS", 3))
+        plain_shirts = processor.generate_plain_shirts(image_rgba, masks, ratio_thresh=ratio_thr, inpaint_radius=radius)
+        if plain_shirts:
+            chosen = plain_shirts[1] if len(plain_shirts) >= 2 else plain_shirts[0]
+            out_ps = os.path.join(object_dir, "plain_shirt_2.png")
+            Image.fromarray(chosen).save(out_ps)
+            object_paths.append(out_ps)
+            logger.info("Generated plain_shirt_2.png")
+    except Exception as e:
+        logger.error(f"Plain shirt generation failed error={str(e)}")
 
     # Quality enhancement and QA artifacts for pipeline mode
     try:
@@ -174,11 +213,37 @@ async def process_image_pipeline(
         "diff": os.path.join(output_dir, "diff.png") if os.path.exists(os.path.join(output_dir, "diff.png")) else None,
     }
 
+    drive_uploads: List[Dict[str, Any]] = []
+    try:
+        if bool(settings.GOOGLE_DRIVE_ENABLED):
+            from app.services.storage.google_drive import GoogleDriveService
+            drive = GoogleDriveService()
+            folder_id = settings.DRIVE_FOLDER_ID
+            to_upload: List[str] = []
+            if files["overlay"]:
+                to_upload.append(files["overlay"])
+            to_upload.extend(files["masks"] or [])
+            to_upload.extend(files["objects"] or [])
+            if files["source_enhanced"]:
+                to_upload.append(files["source_enhanced"])
+            if files["quality"]:
+                to_upload.append(files["quality"])
+            if files["diff"]:
+                to_upload.append(files["diff"])
+            for p in to_upload:
+                try:
+                    fid, web = drive.upload_file(p, folder_id=folder_id)
+                    drive_uploads.append({"path": p, "file_id": fid, "web_view": web})
+                except Exception as e:
+                    logger.error(f"Drive upload failed path={p} error={str(e)}")
+    except Exception as e:
+        logger.error(f"Drive upload init failed error={str(e)}")
+
     logger.info(f"Pipeline completed in {time.perf_counter() - t_start:.2f}s")
     return PipelineResult(
         job_id=job_id,
         output_dir=output_dir,
-        files=files,
+        files={**files, "drive": drive_uploads},
         objects_count=len(object_paths),
         parameters=auto_params,
     )
